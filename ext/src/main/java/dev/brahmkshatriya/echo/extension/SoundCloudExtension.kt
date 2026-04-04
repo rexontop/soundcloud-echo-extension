@@ -5,15 +5,21 @@ import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
-import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
+import dev.brahmkshatriya.echo.common.clients.PlaylistClient
+import dev.brahmkshatriya.echo.common.clients.QuickSearchClient
+import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.ContinuationCallback.Companion.await
 import dev.brahmkshatriya.echo.common.helpers.WebViewRequest
 import dev.brahmkshatriya.echo.common.models.Artist
+import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.ImageHolder.Companion.toImageHolder
 import dev.brahmkshatriya.echo.common.models.NetworkRequest
+import dev.brahmkshatriya.echo.common.models.Playlist
+import dev.brahmkshatriya.echo.common.models.QuickSearchItem
+import dev.brahmkshatriya.echo.common.models.Radio
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Streamable.Media.Companion.toServerMedia
@@ -32,8 +38,8 @@ import kotlinx.serialization.json.longOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-class SoundCloudExtension : ExtensionClient, SearchFeedClient, TrackClient,
-    HomeFeedClient, LibraryFeedClient, LoginClient.WebView, ArtistClient {
+class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
+    HomeFeedClient, LibraryFeedClient, LoginClient.WebView, ArtistClient, PlaylistClient, RadioClient {
 
     private val httpClient = OkHttpClient()
     private lateinit var setting: Settings
@@ -60,32 +66,26 @@ class SoundCloudExtension : ExtensionClient, SearchFeedClient, TrackClient,
 
     override suspend fun onInitialize() {}
 
+    // ---- LOGIN ----
+
     override val webViewRequest = object : WebViewRequest.Cookie<List<User>> {
         override val initialUrl = NetworkRequest("https://soundcloud.com/signin")
         override val stopUrlRegex = Regex("soundcloud\\.com/discover|soundcloud\\.com/feed|soundcloud\\.com/you")
 
-        override suspend fun onStop(
-            url: NetworkRequest,
-            cookie: String
-        ): List<User>? {
+        override suspend fun onStop(url: NetworkRequest, cookie: String): List<User>? {
             val token = cookie.split(";")
                 .map { it.trim() }
                 .firstOrNull { it.startsWith("auth_token=") || it.startsWith("oauth_token=") }
-                ?.split("=", limit = 2)
-                ?.getOrNull(1)
-                ?.trim()
-                ?.removeSurrounding("\"")
+                ?.split("=", limit = 2)?.getOrNull(1)?.trim()?.removeSurrounding("\"")
                 ?: return null
 
             oauthToken = token
             setting.putString("auth_token", token)
 
-            val request = Request.Builder()
-                .url("https://api-v2.soundcloud.com/me?client_id=$clientId")
-                .header("Authorization", "OAuth $token")
-                .build()
-            val response = httpClient.newCall(request).await()
-            val body = response.body?.string() ?: return null
+            val body = httpClient.newCall(
+                Request.Builder().url("https://api-v2.soundcloud.com/me?client_id=$clientId")
+                    .header("Authorization", "OAuth $token").build()
+            ).await().body?.string() ?: return null
             val root = json.parseToJsonElement(body).jsonObject
             val user = User(
                 id = root["id"]!!.jsonPrimitive.long.toString(),
@@ -104,65 +104,66 @@ class SoundCloudExtension : ExtensionClient, SearchFeedClient, TrackClient,
 
     override suspend fun getCurrentUser(): User? = currentUser
 
+    // ---- HOME FEED ----
+
     override suspend fun loadHomeFeed(): Feed<Shelf> {
         val shelves = mutableListOf<Shelf>()
 
         if (oauthToken != null) {
             runCatching {
-                val recentBody = httpClient.newCall(
+                val body = httpClient.newCall(
                     Request.Builder()
                         .url("https://api-v2.soundcloud.com/me/play-history/tracks?client_id=$clientId&limit=10")
-                        .header("Authorization", "OAuth $oauthToken")
-                        .build()
+                        .header("Authorization", "OAuth $oauthToken").build()
                 ).await().body?.string()
-                if (!recentBody.isNullOrBlank()) {
-                    val recentTracks = json.parseToJsonElement(recentBody).jsonObject["collection"]!!
+                if (!body.isNullOrBlank()) {
+                    val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
                         .jsonArray.mapNotNull { it.jsonObject["track"]?.jsonObject?.toTrack() }
                         .filter { !hideSnip || !it.extras.containsKey("snip") }
-                    if (recentTracks.isNotEmpty())
-                        shelves.add(Shelf.Lists.Tracks(id = "recently_played", title = "Recently Played", list = recentTracks))
+                    if (tracks.isNotEmpty())
+                        shelves.add(Shelf.Lists.Tracks(id = "recently_played", title = "Recently Played", list = tracks))
                 }
             }
 
             runCatching {
-                val streamBody = httpClient.newCall(
+                val body = httpClient.newCall(
                     Request.Builder()
                         .url("https://api-v2.soundcloud.com/stream?client_id=$clientId&limit=20")
-                        .header("Authorization", "OAuth $oauthToken")
-                        .build()
+                        .header("Authorization", "OAuth $oauthToken").build()
                 ).await().body?.string()
-                if (!streamBody.isNullOrBlank()) {
-                    val streamTracks = json.parseToJsonElement(streamBody).jsonObject["collection"]!!
+                if (!body.isNullOrBlank()) {
+                    val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
                         .jsonArray.mapNotNull {
                             val obj = it.jsonObject
                             val track = obj["track"]?.jsonObject
                                 ?: if (obj["kind"]?.jsonPrimitive?.content == "track") obj else null
                             track?.toTrack()
-                        }
-                        .filter { !hideSnip || !it.extras.containsKey("snip") }
-                    if (streamTracks.isNotEmpty())
-                        shelves.add(Shelf.Lists.Tracks(id = "your_stream", title = "Your Stream", list = streamTracks))
+                        }.filter { !hideSnip || !it.extras.containsKey("snip") }
+                    if (tracks.isNotEmpty())
+                        shelves.add(Shelf.Lists.Tracks(id = "your_stream", title = "Your Stream", list = tracks))
                 }
             }
         }
 
         runCatching {
-            val trendingBody = httpClient.newCall(
+            val body = httpClient.newCall(
                 Request.Builder()
                     .url("https://api-v2.soundcloud.com/charts?kind=trending&genre=soundcloud:genres:all-music&client_id=$clientId&limit=20")
                     .build()
             ).await().body?.string()
-            if (!trendingBody.isNullOrBlank()) {
-                val trendingTracks = json.parseToJsonElement(trendingBody).jsonObject["collection"]!!
+            if (!body.isNullOrBlank()) {
+                val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
                     .jsonArray.mapNotNull { it.jsonObject["track"]?.jsonObject?.toTrack() }
                     .filter { !hideSnip || !it.extras.containsKey("snip") }
-                if (trendingTracks.isNotEmpty())
-                    shelves.add(Shelf.Lists.Tracks(id = "trending", title = "Trending", list = trendingTracks))
+                if (tracks.isNotEmpty())
+                    shelves.add(Shelf.Lists.Tracks(id = "trending", title = "Trending", list = tracks))
             }
         }
 
         return shelves.toFeed()
     }
+
+    // ---- LIBRARY ----
 
     override suspend fun loadLibraryFeed(): Feed<Shelf> {
         val token = oauthToken ?: return listOf<Shelf>().toFeed()
@@ -173,75 +174,219 @@ class SoundCloudExtension : ExtensionClient, SearchFeedClient, TrackClient,
             val body = httpClient.newCall(
                 Request.Builder()
                     .url("https://api-v2.soundcloud.com/users/$userId/track_likes?client_id=$clientId&limit=20")
-                    .header("Authorization", "OAuth $token")
-                    .build()
+                    .header("Authorization", "OAuth $token").build()
             ).await().body?.string()
             if (!body.isNullOrBlank()) {
-                val likedTracks = json.parseToJsonElement(body).jsonObject["collection"]!!
+                val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
                     .jsonArray.mapNotNull {
                         val obj = it.jsonObject
                         obj["track"]?.jsonObject?.toTrack()
                             ?: if (obj["kind"]?.jsonPrimitive?.content == "track") obj.toTrack() else null
-                    }
-                    .filter { !hideSnip || !it.extras.containsKey("snip") }
-                if (likedTracks.isNotEmpty())
-                    shelves.add(Shelf.Lists.Tracks(id = "liked_tracks", title = "Liked Tracks", list = likedTracks))
+                    }.filter { !hideSnip || !it.extras.containsKey("snip") }
+                if (tracks.isNotEmpty())
+                    shelves.add(Shelf.Lists.Tracks(id = "liked_tracks", title = "Liked Tracks", list = tracks))
+            }
+        }
+
+        runCatching {
+            val body = httpClient.newCall(
+                Request.Builder()
+                    .url("https://api-v2.soundcloud.com/me/playlists?client_id=$clientId&limit=20")
+                    .header("Authorization", "OAuth $token").build()
+            ).await().body?.string()
+            if (!body.isNullOrBlank()) {
+                val playlists = json.parseToJsonElement(body).jsonObject["collection"]!!
+                    .jsonArray.mapNotNull { runCatching { it.jsonObject.toPlaylist() }.getOrNull() }
+                if (playlists.isNotEmpty())
+                    shelves.add(Shelf.Lists.Items(
+                        id = "playlists",
+                        title = "Playlists",
+                        list = playlists.map { it.toShelf().media }
+                    ))
             }
         }
 
         return shelves.toFeed()
     }
 
-    override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+    // ---- SEARCH ----
+
+    override suspend fun quickSearch(query: String): List<QuickSearchItem> {
+        if (query.isBlank()) return emptyList()
         val body = httpClient.newCall(
             Request.Builder()
-                .url("https://api-v2.soundcloud.com/search/tracks?q=$query&client_id=$clientId&limit=20")
+                .url("https://api-v2.soundcloud.com/search/autocomplete?q=$query&client_id=$clientId&limit=5")
                 .build()
-        ).await().body?.string()
-        if (body.isNullOrBlank()) return listOf<Shelf>().toFeed()
-        val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
-            .jsonArray.map { it.jsonObject.toTrack() }
-            .filter { !hideSnip || !it.extras.containsKey("snip") }
-        return listOf<Shelf>(Shelf.Lists.Tracks(id = "search_results", title = "Results", list = tracks)).toFeed()
+        ).await().body?.string() ?: return emptyList()
+        return runCatching {
+            json.parseToJsonElement(body).jsonObject["collection"]!!.jsonArray
+                .mapNotNull { it.jsonObject["output"]?.jsonPrimitive?.contentOrNull }
+                .map { QuickSearchItem.Query(it, false) }
+        }.getOrDefault(emptyList())
     }
+
+    override suspend fun deleteQuickSearch(item: QuickSearchItem) {}
+
+    override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+        val shelves = mutableListOf<Shelf>()
+
+        runCatching {
+            val body = httpClient.newCall(
+                Request.Builder()
+                    .url("https://api-v2.soundcloud.com/search/tracks?q=$query&client_id=$clientId&limit=20")
+                    .build()
+            ).await().body?.string()
+            if (!body.isNullOrBlank()) {
+                val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
+                    .jsonArray.mapNotNull { runCatching { it.jsonObject.toTrack() }.getOrNull() }
+                    .filter { !hideSnip || !it.extras.containsKey("snip") }
+                if (tracks.isNotEmpty())
+                    shelves.add(Shelf.Lists.Tracks(id = "search_tracks", title = "Tracks", list = tracks))
+            }
+        }
+
+        runCatching {
+            val body = httpClient.newCall(
+                Request.Builder()
+                    .url("https://api-v2.soundcloud.com/search/playlists?q=$query&client_id=$clientId&limit=10")
+                    .build()
+            ).await().body?.string()
+            if (!body.isNullOrBlank()) {
+                val playlists = json.parseToJsonElement(body).jsonObject["collection"]!!
+                    .jsonArray.mapNotNull { runCatching { it.jsonObject.toPlaylist() }.getOrNull() }
+                if (playlists.isNotEmpty())
+                    shelves.add(Shelf.Lists.Items(
+                        id = "search_playlists",
+                        title = "Playlists",
+                        list = playlists.map { it.toShelf().media }
+                    ))
+            }
+        }
+
+        runCatching {
+            val body = httpClient.newCall(
+                Request.Builder()
+                    .url("https://api-v2.soundcloud.com/search/users?q=$query&client_id=$clientId&limit=10")
+                    .build()
+            ).await().body?.string()
+            if (!body.isNullOrBlank()) {
+                val artists = json.parseToJsonElement(body).jsonObject["collection"]!!
+                    .jsonArray.mapNotNull { runCatching { it.jsonObject.toArtist() }.getOrNull() }
+                if (artists.isNotEmpty())
+                    shelves.add(Shelf.Lists.Items(
+                        id = "search_users",
+                        title = "Users",
+                        list = artists.map { it.toShelf().media }
+                    ))
+            }
+        }
+
+        return shelves.toFeed()
+    }
+
+    // ---- ARTIST ----
 
     override suspend fun loadArtist(artist: Artist): Artist {
         val body = httpClient.newCall(
             Request.Builder()
-                .url("https://api-v2.soundcloud.com/users/${artist.id}?client_id=$clientId")
-                .build()
+                .url("https://api-v2.soundcloud.com/users/${artist.id}?client_id=$clientId").build()
         ).await().body?.string() ?: return artist
         val root = json.parseToJsonElement(body).jsonObject
         return Artist(
             id = artist.id,
             name = root["username"]!!.jsonPrimitive.content,
-            cover = root["avatar_url"]?.jsonPrimitive?.contentOrNull
-                ?.replace("large", "t500x500")?.toImageHolder(),
+            cover = root["avatar_url"]?.jsonPrimitive?.contentOrNull?.replace("large", "t500x500")?.toImageHolder(),
             bio = root["description"]?.jsonPrimitive?.contentOrNull,
-            subtitle = root["followers_count"]?.jsonPrimitive?.longOrNull
-                ?.let { if (it > 0) "$it followers" else null }
+            subtitle = root["followers_count"]?.jsonPrimitive?.longOrNull?.let { if (it > 0) "$it followers" else null }
         )
     }
 
     override suspend fun loadFeed(artist: Artist): Feed<Shelf> {
+        val shelves = mutableListOf<Shelf>()
+
+        runCatching {
+            val body = httpClient.newCall(
+                Request.Builder()
+                    .url("https://api-v2.soundcloud.com/users/${artist.id}/tracks?client_id=$clientId&limit=20").build()
+            ).await().body?.string()
+            if (!body.isNullOrBlank()) {
+                val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
+                    .jsonArray.mapNotNull { runCatching { it.jsonObject.toTrack() }.getOrNull() }
+                    .filter { !hideSnip || !it.extras.containsKey("snip") }
+                if (tracks.isNotEmpty())
+                    shelves.add(Shelf.Lists.Tracks(id = "artist_tracks", title = "Tracks", list = tracks))
+            }
+        }
+
+        runCatching {
+            val body = httpClient.newCall(
+                Request.Builder()
+                    .url("https://api-v2.soundcloud.com/users/${artist.id}/playlists?client_id=$clientId&limit=10").build()
+            ).await().body?.string()
+            if (!body.isNullOrBlank()) {
+                val playlists = json.parseToJsonElement(body).jsonObject["collection"]!!
+                    .jsonArray.mapNotNull { runCatching { it.jsonObject.toPlaylist() }.getOrNull() }
+                if (playlists.isNotEmpty())
+                    shelves.add(Shelf.Lists.Items(
+                        id = "artist_playlists",
+                        title = "Playlists",
+                        list = playlists.map { it.toShelf().media }
+                    ))
+            }
+        }
+
+        return shelves.toFeed()
+    }
+
+    // ---- PLAYLIST ----
+
+    override suspend fun loadPlaylist(playlist: Playlist): Playlist = playlist
+
+    override suspend fun loadTracks(playlist: Playlist): Feed<Track> {
         val body = httpClient.newCall(
             Request.Builder()
-                .url("https://api-v2.soundcloud.com/users/${artist.id}/tracks?client_id=$clientId&limit=20")
-                .build()
+                .url("https://api-v2.soundcloud.com/playlists/${playlist.id}/tracks?client_id=$clientId&limit=50").build()
         ).await().body?.string()
-        if (body.isNullOrBlank()) return listOf<Shelf>().toFeed()
+        if (body.isNullOrBlank()) return listOf<Track>().toFeed()
         val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
             .jsonArray.mapNotNull { runCatching { it.jsonObject.toTrack() }.getOrNull() }
             .filter { !hideSnip || !it.extras.containsKey("snip") }
-        return listOf<Shelf>(Shelf.Lists.Tracks(id = "artist_tracks", title = "Tracks", list = tracks)).toFeed()
+        return tracks.toFeed()
     }
+
+    override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = null
+
+    // ---- RADIO ----
+
+    override suspend fun radio(item: EchoMediaItem, context: EchoMediaItem?): Radio {
+        return Radio(
+            id = item.id,
+            title = "Radio: ${item.title}",
+            cover = item.cover,
+            extras = mapOf("seed_id" to item.id)
+        )
+    }
+
+    override suspend fun loadRadio(radio: Radio): Radio = radio
+
+    override suspend fun loadTracks(radio: Radio): Feed<Track> {
+        val seedId = radio.extras["seed_id"] ?: radio.id
+        val body = httpClient.newCall(
+            Request.Builder()
+                .url("https://api-v2.soundcloud.com/tracks/$seedId/related?client_id=$clientId&limit=20").build()
+        ).await().body?.string()
+        if (body.isNullOrBlank()) return listOf<Track>().toFeed()
+        val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
+            .jsonArray.mapNotNull { runCatching { it.jsonObject.toTrack() }.getOrNull() }
+            .filter { !hideSnip || !it.extras.containsKey("snip") }
+        return tracks.toFeed()
+    }
+
+    // ---- TRACK ----
 
     override suspend fun loadTrack(track: Track, isDownload: Boolean): Track = track
 
-    override suspend fun loadStreamableMedia(
-        streamable: Streamable,
-        isDownload: Boolean
-    ): Streamable.Media {
+    override suspend fun loadStreamableMedia(streamable: Streamable, isDownload: Boolean): Streamable.Media {
         val url = "${streamable.id}?client_id=$clientId"
         val builder = Request.Builder().url(url)
         oauthToken?.let { builder.header("Authorization", "OAuth $it") }
@@ -249,20 +394,19 @@ class SoundCloudExtension : ExtensionClient, SearchFeedClient, TrackClient,
         if (body.isNullOrBlank()) throw Exception("Empty stream response")
         val streamUrl = json.parseToJsonElement(body).jsonObject["url"]!!.jsonPrimitive.content
         val isHls = streamable.id.contains("hls")
-        return if (isHls)
-            streamUrl.toServerMedia(type = Streamable.SourceType.HLS)
-        else
-            streamUrl.toServerMedia()
+        return if (isHls) streamUrl.toServerMedia(type = Streamable.SourceType.HLS)
+        else streamUrl.toServerMedia()
     }
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
+
+    // ---- HELPERS ----
 
     private fun kotlinx.serialization.json.JsonObject.toTrack(): Track {
         val id = this["id"]!!.jsonPrimitive.long.toString()
         val title = this["title"]!!.jsonPrimitive.content
         val duration = this["duration"]!!.jsonPrimitive.long
-        val artwork = this["artwork_url"]?.jsonPrimitive?.contentOrNull
-            ?.replace("large", "t500x500")
+        val artwork = this["artwork_url"]?.jsonPrimitive?.contentOrNull?.replace("large", "t500x500")
         val user = this["user"]!!.jsonObject
         val artist = Artist(
             id = user["id"]!!.jsonPrimitive.long.toString(),
@@ -283,21 +427,47 @@ class SoundCloudExtension : ExtensionClient, SearchFeedClient, TrackClient,
             transcodings?.forEach { t ->
                 val obj = t.jsonObject
                 val protocol = obj["format"]?.jsonObject?.get("protocol")?.jsonPrimitive?.contentOrNull
-                if (protocol == "hls")
-                    streamUrl = obj["url"]!!.jsonPrimitive.content
+                if (protocol == "hls") streamUrl = obj["url"]!!.jsonPrimitive.content
             }
         }
 
         return Track(
-            id = id,
-            title = title,
-            artists = listOf(artist),
-            cover = artwork?.toImageHolder(),
-            duration = duration,
+            id = id, title = title, artists = listOf(artist),
+            cover = artwork?.toImageHolder(), duration = duration,
             extras = if (isSnip) mapOf("snip" to "true") else emptyMap(),
             streamables = if (streamUrl.isNotEmpty())
                 listOf(Streamable.server(id = streamUrl, quality = 0))
             else emptyList()
+        )
+    }
+
+    private fun kotlinx.serialization.json.JsonObject.toPlaylist(): Playlist {
+        val id = this["id"]!!.jsonPrimitive.long.toString()
+        val title = this["title"]!!.jsonPrimitive.content
+        val artwork = this["artwork_url"]?.jsonPrimitive?.contentOrNull?.replace("large", "t500x500")
+        val user = this["user"]?.jsonObject
+        val artist = user?.let {
+            Artist(
+                id = it["id"]!!.jsonPrimitive.long.toString(),
+                name = it["username"]!!.jsonPrimitive.content,
+                cover = it["avatar_url"]?.jsonPrimitive?.contentOrNull?.toImageHolder()
+            )
+        }
+        return Playlist(
+            id = id, title = title, isEditable = false, isPrivate = false,
+            cover = artwork?.toImageHolder(),
+            authors = if (artist != null) listOf(artist) else emptyList(),
+            trackCount = this["track_count"]?.jsonPrimitive?.longOrNull,
+            description = this["description"]?.jsonPrimitive?.contentOrNull
+        )
+    }
+
+    private fun kotlinx.serialization.json.JsonObject.toArtist(): Artist {
+        return Artist(
+            id = this["id"]!!.jsonPrimitive.long.toString(),
+            name = this["username"]!!.jsonPrimitive.content,
+            cover = this["avatar_url"]?.jsonPrimitive?.contentOrNull?.replace("large", "t500x500")?.toImageHolder(),
+            subtitle = this["followers_count"]?.jsonPrimitive?.longOrNull?.let { if (it > 0) "$it followers" else null }
         )
     }
 }
