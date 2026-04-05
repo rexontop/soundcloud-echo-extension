@@ -91,9 +91,9 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
         }
     }
 
-    private fun authHeader(builder: Request.Builder): Request.Builder {
-        oauthToken?.let { builder.header("Authorization", "OAuth $it") }
-        return builder
+    private fun Request.Builder.withAuth(): Request.Builder {
+        oauthToken?.let { header("Authorization", "OAuth $it") }
+        return this
     }
 
     // ---- LOGIN ----
@@ -113,7 +113,8 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
             setting.putString("auth_token", token)
 
             val body = httpClient.newCall(
-                authHeader(Request.Builder().url("https://api-v2.soundcloud.com/me?client_id=$clientId")).build()
+                Request.Builder().url("https://api-v2.soundcloud.com/me?client_id=$clientId")
+                    .withAuth().build()
             ).await().body?.string() ?: return null
             val root = json.parseToJsonElement(body).jsonObject
             val user = User(
@@ -137,32 +138,26 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
 
     override suspend fun isItemLiked(item: EchoMediaItem): Boolean {
         val token = oauthToken ?: return false
-        val trackId = when (item) {
-            is Track -> item.id
-            else -> return false
-        }
-        val body = httpClient.newCall(
+        val userId = currentUser?.id ?: return false
+        val trackId = (item as? Track)?.id ?: return false
+        val response = httpClient.newCall(
             Request.Builder()
-                .url("https://api-v2.soundcloud.com/me/track_likes/$trackId?client_id=$clientId")
+                .url("https://api-v2.soundcloud.com/users/$userId/track_likes/$trackId?client_id=$clientId")
                 .header("Authorization", "OAuth $token").build()
         ).await()
-        return body.code == 200
+        return response.code == 200
     }
 
     override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) {
         val token = oauthToken ?: return
-        val trackId = when (item) {
-            is Track -> item.id
-            else -> return
-        }
-        val url = "https://api-v2.soundcloud.com/me/track_likes/$trackId?client_id=$clientId"
-        val request = if (shouldLike) {
+        val userId = currentUser?.id ?: return
+        val trackId = (item as? Track)?.id ?: return
+        val url = "https://api-v2.soundcloud.com/users/$userId/track_likes/$trackId?client_id=$clientId"
+        val request = if (shouldLike)
             Request.Builder().url(url).header("Authorization", "OAuth $token")
                 .put("".toRequestBody("application/json".toMediaType())).build()
-        } else {
-            Request.Builder().url(url).header("Authorization", "OAuth $token")
-                .delete().build()
-        }
+        else
+            Request.Builder().url(url).header("Authorization", "OAuth $token").delete().build()
         httpClient.newCall(request).await()
     }
 
@@ -170,40 +165,29 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
 
     override suspend fun isFollowing(item: EchoMediaItem): Boolean {
         val token = oauthToken ?: return false
-        val artistId = when (item) {
-            is Artist -> item.id
-            else -> return false
-        }
-        val body = httpClient.newCall(
+        val artistId = (item as? Artist)?.id ?: return false
+        val response = httpClient.newCall(
             Request.Builder()
                 .url("https://api-v2.soundcloud.com/me/followings/$artistId?client_id=$clientId")
                 .header("Authorization", "OAuth $token").build()
         ).await()
-        return body.code == 200
+        return response.code == 200
     }
 
     override suspend fun followItem(item: EchoMediaItem, shouldFollow: Boolean) {
         val token = oauthToken ?: return
-        val artistId = when (item) {
-            is Artist -> item.id
-            else -> return
-        }
+        val artistId = (item as? Artist)?.id ?: return
         val url = "https://api-v2.soundcloud.com/me/followings/$artistId?client_id=$clientId"
-        val request = if (shouldFollow) {
+        val request = if (shouldFollow)
             Request.Builder().url(url).header("Authorization", "OAuth $token")
                 .put("".toRequestBody("application/json".toMediaType())).build()
-        } else {
-            Request.Builder().url(url).header("Authorization", "OAuth $token")
-                .delete().build()
-        }
+        else
+            Request.Builder().url(url).header("Authorization", "OAuth $token").delete().build()
         httpClient.newCall(request).await()
     }
 
     override suspend fun getFollowersCount(item: EchoMediaItem): Long? {
-        val artistId = when (item) {
-            is Artist -> item.id
-            else -> return null
-        }
+        val artistId = (item as? Artist)?.id ?: return null
         val body = httpClient.newCall(
             Request.Builder()
                 .url("https://api-v2.soundcloud.com/users/$artistId?client_id=$clientId").build()
@@ -219,8 +203,9 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
         if (oauthToken != null) {
             runCatching {
                 val body = httpClient.newCall(
-                    authHeader(Request.Builder()
-                        .url("https://api-v2.soundcloud.com/me/play-history/tracks?client_id=$clientId&limit=10")).build()
+                    Request.Builder()
+                        .url("https://api-v2.soundcloud.com/me/play-history/tracks?client_id=$clientId&limit=10")
+                        .withAuth().build()
                 ).await().body?.string()
                 if (!body.isNullOrBlank()) {
                     val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
@@ -233,16 +218,16 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
 
             runCatching {
                 val body = httpClient.newCall(
-                    authHeader(Request.Builder()
-                        .url("https://api-v2.soundcloud.com/stream?client_id=$clientId&limit=20")).build()
+                    Request.Builder()
+                        .url("https://api-v2.soundcloud.com/stream?client_id=$clientId&limit=20")
+                        .withAuth().build()
                 ).await().body?.string()
                 if (!body.isNullOrBlank()) {
                     val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
                         .jsonArray.mapNotNull {
                             val obj = it.jsonObject
-                            val kind = obj["kind"]?.jsonPrimitive?.contentOrNull
                             val track = obj["track"]?.jsonObject
-                                ?: if (kind == "track") obj else null
+                                ?: if (obj["kind"]?.jsonPrimitive?.content == "track") obj else null
                             track?.toTrack()
                         }.filter { !hideSnip || !it.extras.containsKey("snip") }
                     if (tracks.isNotEmpty())
@@ -297,7 +282,7 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
         runCatching {
             val body = httpClient.newCall(
                 Request.Builder()
-                    .url("https://api-v2.soundcloud.com/me/playlists?client_id=$clientId&limit=20")
+                    .url("https://api-v2.soundcloud.com/users/$userId/playlists_without_albums?client_id=$clientId&limit=20")
                     .header("Authorization", "OAuth $token").build()
             ).await().body?.string()
             if (!body.isNullOrBlank()) {
@@ -425,7 +410,7 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
         runCatching {
             val body = httpClient.newCall(
                 Request.Builder()
-                    .url("https://api-v2.soundcloud.com/users/${artist.id}/playlists?client_id=$clientId&limit=10").build()
+                    .url("https://api-v2.soundcloud.com/users/${artist.id}/playlists_without_albums?client_id=$clientId&limit=10").build()
             ).await().body?.string()
             if (!body.isNullOrBlank()) {
                 val playlists = json.parseToJsonElement(body).jsonObject["collection"]!!
@@ -448,11 +433,24 @@ class SoundCloudExtension : ExtensionClient, QuickSearchClient, TrackClient,
     override suspend fun loadTracks(playlist: Playlist): Feed<Track> {
         val body = httpClient.newCall(
             Request.Builder()
-                .url("https://api-v2.soundcloud.com/playlists/${playlist.id}/tracks?client_id=$clientId&limit=50").build()
+                .url("https://api-v2.soundcloud.com/playlists/${playlist.id}?client_id=$clientId&representation=full").build()
         ).await().body?.string()
         if (body.isNullOrBlank()) return listOf<Track>().toFeed()
-        val tracks = json.parseToJsonElement(body).jsonObject["collection"]!!
-            .jsonArray.mapNotNull { runCatching { it.jsonObject.toTrack() }.getOrNull() }
+        val root = json.parseToJsonElement(body).jsonObject
+        val trackIds = root["tracks"]?.jsonArray?.mapNotNull {
+            it.jsonObject["id"]?.jsonPrimitive?.longOrNull?.toString()
+        } ?: return listOf<Track>().toFeed()
+
+        if (trackIds.isEmpty()) return listOf<Track>().toFeed()
+
+        val idsParam = trackIds.take(50).joinToString(",")
+        val tracksBody = httpClient.newCall(
+            Request.Builder()
+                .url("https://api-v2.soundcloud.com/tracks?ids=$idsParam&client_id=$clientId").build()
+        ).await().body?.string() ?: return listOf<Track>().toFeed()
+
+        val tracks = json.parseToJsonElement(tracksBody).jsonArray
+            .mapNotNull { runCatching { it.jsonObject.toTrack() }.getOrNull() }
             .filter { !hideSnip || !it.extras.containsKey("snip") }
         return tracks.toFeed()
     }
